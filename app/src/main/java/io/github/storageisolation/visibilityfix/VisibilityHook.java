@@ -15,6 +15,30 @@ import io.github.libxposed.api.XposedModuleInterface.SystemServerStartingParam;
 public final class VisibilityHook extends XposedModule {
     private static final String TAG = "SIVisibilityFix";
     private static final String TARGET_PACKAGE = "moe.shizuku.redirectstorage";
+
+    /** Obfuscated names inside one Storage Isolation build. */
+    private static final class AppTarget {
+        final String label, serviceClass, listMethod, oneMethod, holderClass, holderMethod;
+
+        AppTarget(String label, String serviceClass, String listMethod, String oneMethod,
+                String holderClass, String holderMethod) {
+            this.label = label;
+            this.serviceClass = serviceClass;
+            this.listMethod = listMethod;
+            this.oneMethod = oneMethod;
+            this.holderClass = holderClass;
+            this.holderMethod = holderMethod;
+        }
+    }
+
+    private static final AppTarget[] APP_TARGETS = {
+            // Build originally analyzed by the module author.
+            new AppTarget("original", "ef1", "尾巴捏捏", "没收门", "g10", "嘟嘟噜"),
+            // Storage Isolation v8.7.4 (r3678): service wrapper is bb1; its static
+            // no-arg bb1.没收桌子() returns the singleton (null if the server is not bound).
+            new AppTarget("v8.7.4-r3678", "bb1", "没收星星月亮小熊抱枕", "两百米袖子",
+                    "bb1", "没收桌子"),
+    };
     private volatile TargetIdentity targetIdentity;
     private Method packageStateLookup;
     private Method packageAppId;
@@ -168,37 +192,55 @@ public final class VisibilityHook extends XposedModule {
 
     @Override public void onPackageLoaded(PackageLoadedParam param) {
         if (!TARGET_PACKAGE.equals(param.getPackageName())) return;
-        try {
-            ClassLoader loader = param.getDefaultClassLoader();
-            Class<?> type = Class.forName(TARGET_PACKAGE + ".ef1", false, loader);
-            Method method = type.getDeclaredMethod("尾巴捏捏", int.class, int.class);
-            hook(method).intercept(chain -> {
-                Object result = chain.proceed();
-                if (result instanceof List && ((List<?>) result).isEmpty()) {
-                    return recoverServiceRecords(loader, type,
-                            (Integer) chain.getArg(0), result);
-                }
-                return result;
-            });
-            log(Log.INFO, TAG, "Empty service list fallback installed");
-        } catch (Throwable error) {
-            log(Log.ERROR, TAG, "Cannot hook Storage Isolation service list", error);
+        final ClassLoader loader = param.getDefaultClassLoader();
+        Throwable lastError = null;
+        for (final AppTarget target : APP_TARGETS) {
+            try {
+                // Resolve everything first so a same-named but unrelated class
+                // (e.g. "ef1" in newer builds) never gets hooked by mistake.
+                final Class<?> type = Class.forName(
+                        TARGET_PACKAGE + "." + target.serviceClass, false, loader);
+                Method method = type.getDeclaredMethod(target.listMethod,
+                        int.class, int.class);
+                type.getDeclaredMethod(target.oneMethod,
+                        String.class, int.class, int.class);
+                Class.forName(TARGET_PACKAGE + "." + target.holderClass, false, loader)
+                        .getDeclaredMethod(target.holderMethod);
+                hook(method).intercept(chain -> {
+                    Object result = chain.proceed();
+                    if (result instanceof List && ((List<?>) result).isEmpty()) {
+                        return recoverServiceRecords(loader, type, target,
+                                (Integer) chain.getArg(0), result);
+                    }
+                    return result;
+                });
+                log(Log.INFO, TAG, "Empty service list fallback installed ("
+                        + target.label + ")");
+                return;
+            } catch (Throwable error) {
+                lastError = error;
+            }
         }
+        log(Log.ERROR, TAG, "Cannot hook Storage Isolation service list; "
+                + "app build matches none of " + APP_TARGETS.length + " known targets",
+                lastError);
     }
 
     private Object recoverServiceRecords(ClassLoader loader, Class<?> serviceType,
-            int flags, Object original) {
+            AppTarget target, int flags, Object original) {
         try {
             Object app = Class.forName("android.app.ActivityThread")
                     .getDeclaredMethod("currentApplication").invoke(null);
             if (!(app instanceof Context)) return original;
             List<PackageInfo> installed = ((Context) app).getPackageManager()
                     .getInstalledPackages(0);
-            Class<?> singleton = Class.forName(TARGET_PACKAGE + ".g10", false, loader);
-            Method getService = singleton.getDeclaredMethod("嘟嘟噜");
+            Class<?> singleton = Class.forName(
+                    TARGET_PACKAGE + "." + target.holderClass, false, loader);
+            Method getService = singleton.getDeclaredMethod(target.holderMethod);
             getService.setAccessible(true);
             Object service = getService.invoke(null);
-            Method getOne = serviceType.getDeclaredMethod("没收门",
+            if (service == null) return original; // server not bound yet
+            Method getOne = serviceType.getDeclaredMethod(target.oneMethod,
                     String.class, int.class, int.class);
             getOne.setAccessible(true);
             List<Object> recovered = new ArrayList<>();
